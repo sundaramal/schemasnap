@@ -1,72 +1,61 @@
-"""Core module for capturing and storing database schema snapshots."""
+"""Snapshot capture, persistence, and retrieval utilities."""
 
-import json
 import hashlib
+import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 
-SNAPSHOT_DIR = Path(".schemasnap/snapshots")
-
-
 def compute_schema_hash(schema: dict) -> str:
-    """Compute a stable SHA256 hash of a schema dictionary."""
-    serialized = json.dumps(schema, sort_keys=True, ensure_ascii=True)
-    return hashlib.sha256(serialized.encode()).hexdigest()
+    """Return a stable SHA-256 hex digest for *schema*."""
+    serialised = json.dumps(schema, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialised.encode()).hexdigest()
 
 
-def capture_snapshot(env: str, schema: dict, label: Optional[str] = None) -> Path:
-    """
-    Save a schema snapshot for the given environment.
-
-    Args:
-        env: Environment name (e.g. 'production', 'staging').
-        schema: Dictionary representing the database schema.
-        label: Optional human-readable label for the snapshot.
-
-    Returns:
-        Path to the saved snapshot file.
-    """
-    SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
-
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+def capture_snapshot(schema: dict, env: str, snapshot_dir: str) -> str:
+    """Persist *schema* as a JSON snapshot file and return its path."""
+    os.makedirs(snapshot_dir, exist_ok=True)
     schema_hash = compute_schema_hash(schema)
-
-    snapshot = {
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    filename = f"{env}_{timestamp}_{schema_hash[:8]}.json"
+    path = os.path.join(snapshot_dir, filename)
+    payload = {
         "env": env,
         "timestamp": timestamp,
-        "label": label or "",
-        "schema_hash": schema_hash,
+        "hash": schema_hash,
         "schema": schema,
     }
-
-    filename = SNAPSHOT_DIR / f"{env}_{timestamp}_{schema_hash[:8]}.json"
-    filename.write_text(json.dumps(snapshot, indent=2))
-    return filename
-
-
-def load_snapshot(path: Path) -> dict:
-    """Load a snapshot from a JSON file."""
-    if not path.exists():
-        raise FileNotFoundError(f"Snapshot not found: {path}")
-    return json.loads(path.read_text())
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+    return path
 
 
-def list_snapshots(env: Optional[str] = None) -> list[Path]:
-    """
-    List all available snapshots, optionally filtered by environment.
+def load_snapshot(path: str) -> dict:
+    """Load and return a snapshot dict from *path*."""
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
 
-    Returns:
-        Sorted list of snapshot file paths (oldest first).
-    """
-    if not SNAPSHOT_DIR.exists():
+
+def list_snapshots(snapshot_dir: str, env: Optional[str] = None) -> list[str]:
+    """Return sorted snapshot file paths, optionally filtered by *env*."""
+    base = Path(snapshot_dir)
+    if not base.exists():
         return []
-    pattern = f"{env}_*.json" if env else "*.json"
-    return sorted(SNAPSHOT_DIR.glob(pattern))
+    files = sorted(base.glob("*.json"))
+    if env:
+        files = [f for f in files if f.name.startswith(f"{env}_")]
+    return [str(f) for f in files]
 
 
-def latest_snapshot(env: str) -> Optional[Path]:
-    """Return the most recent snapshot for an environment, or None."""
-    snapshots = list_snapshots(env)
+def latest_snapshot(
+    snapshot_dir: str,
+    env: Optional[str] = None,
+    exclude: Optional[str] = None,
+) -> Optional[str]:
+    """Return the most recent snapshot path, optionally excluding *exclude*."""
+    snapshots = list_snapshots(snapshot_dir, env)
+    if exclude:
+        snapshots = [s for s in snapshots if s != exclude]
     return snapshots[-1] if snapshots else None

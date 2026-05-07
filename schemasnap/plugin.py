@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import importlib
+importlib
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
@@ -32,6 +32,18 @@ class PluginRegistry:
                 f"Available: {list(self.capture_backends)}"
             )
         return self.capture_backends[name]
+
+    def unregister_capture(self, name: str) -> None:
+        """Remove a named capture backend from the registry.
+
+        Raises KeyError if no backend with that name is registered.
+        """
+        if name not in self.capture_backends:
+            raise KeyError(
+                f"No capture backend named '{name}' to unregister. "
+                f"Available: {list(self.capture_backends)}"
+            )
+        del self.capture_backends[name]
 
 
 # Module-level default registry

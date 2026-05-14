@@ -1,7 +1,6 @@
 """Tests for schemasnap.lineage and schemasnap.cmd_lineage."""
 from __future__ import annotations
 
-import argparse
 import json
 from pathlib import Path
 
@@ -9,102 +8,165 @@ import pytest
 
 from schemasnap.lineage import (
     LineageEntry,
+    _lineage_path,
     load_lineage,
     record_lineage,
     get_parent,
-    lineage_chain,
+    get_children,
 )
-from schemasnap.cmd_lineage import cmd_lineage
 
 
-@pytest.fixture()
-def tmp_dir(tmp_path: Path) -> str:
-    return str(tmp_path)
+@pytest.fixture
+def tmp_dir(tmp_path: Path) -> Path:
+    return tmp_path
 
 
-def _entry(snapshot_file: str, parent_file=None, env="prod", schema_hash="abc", timestamp="2024-01-01T00:00:00") -> LineageEntry:
-    return LineageEntry(
-        snapshot_file=snapshot_file,
-        parent_file=parent_file,
-        env=env,
-        schema_hash=schema_hash,
-        timestamp=timestamp,
-    )
+def _entry(child: str, parent: str | None = None) -> LineageEntry:
+    return LineageEntry(child_hash=child, parent_hash=parent)
 
 
-def test_load_lineage_empty_when_no_file(tmp_dir):
+# ---------------------------------------------------------------------------
+# load_lineage
+# ---------------------------------------------------------------------------
+
+def test_load_lineage_empty_when_no_file(tmp_dir: Path) -> None:
     assert load_lineage(tmp_dir) == []
 
 
-def test_record_and_load_roundtrip(tmp_dir):
-    e = _entry("snap_v1.json")
-    record_lineage(tmp_dir, e)
-    loaded = load_lineage(tmp_dir)
-    assert len(loaded) == 1
-    assert loaded[0].snapshot_file == "snap_v1.json"
-    assert loaded[0].parent_file is None
-
-
-def test_record_multiple_entries(tmp_dir):
-    record_lineage(tmp_dir, _entry("snap_v1.json"))
-    record_lineage(tmp_dir, _entry("snap_v2.json", parent_file="snap_v1.json"))
+def test_record_and_load_roundtrip(tmp_dir: Path) -> None:
+    record_lineage(tmp_dir, child_hash="abc", parent_hash="000")
     entries = load_lineage(tmp_dir)
-    assert len(entries) == 2
+    assert len(entries) == 1
+    assert entries[0].child_hash == "abc"
+    assert entries[0].parent_hash == "000"
 
 
-def test_get_parent_returns_correct_entry(tmp_dir):
-    record_lineage(tmp_dir, _entry("snap_v1.json"))
-    record_lineage(tmp_dir, _entry("snap_v2.json", parent_file="snap_v1.json"))
-    entry = get_parent(tmp_dir, "snap_v2.json")
-    assert entry is not None
-    assert entry.parent_file == "snap_v1.json"
+def test_record_multiple_entries(tmp_dir: Path) -> None:
+    record_lineage(tmp_dir, child_hash="aaa", parent_hash=None)
+    record_lineage(tmp_dir, child_hash="bbb", parent_hash="aaa")
+    record_lineage(tmp_dir, child_hash="ccc", parent_hash="bbb")
+    entries = load_lineage(tmp_dir)
+    assert len(entries) == 3
+    assert entries[2].child_hash == "ccc"
 
 
-def test_get_parent_returns_none_for_unknown(tmp_dir):
-    assert get_parent(tmp_dir, "nonexistent.json") is None
+def test_record_stores_metadata(tmp_dir: Path) -> None:
+    record_lineage(tmp_dir, child_hash="x1", metadata={"env": "prod"})
+    entries = load_lineage(tmp_dir)
+    assert entries[0].metadata == {"env": "prod"}
 
 
-def test_lineage_chain_returns_ancestry(tmp_dir):
-    record_lineage(tmp_dir, _entry("snap_v1.json"))
-    record_lineage(tmp_dir, _entry("snap_v2.json", parent_file="snap_v1.json"))
-    record_lineage(tmp_dir, _entry("snap_v3.json", parent_file="snap_v2.json"))
-    chain = lineage_chain(tmp_dir, "snap_v3.json")
-    assert [e.snapshot_file for e in chain] == ["snap_v3.json", "snap_v2.json", "snap_v1.json"]
+def test_lineage_file_is_jsonl(tmp_dir: Path) -> None:
+    record_lineage(tmp_dir, child_hash="h1", parent_hash="h0")
+    record_lineage(tmp_dir, child_hash="h2", parent_hash="h1")
+    lines = _lineage_path(tmp_dir).read_text().splitlines()
+    assert len(lines) == 2
+    for line in lines:
+        obj = json.loads(line)
+        assert "child_hash" in obj
 
 
-def test_lineage_chain_empty_for_unknown(tmp_dir):
-    assert lineage_chain(tmp_dir, "ghost.json") == []
+# ---------------------------------------------------------------------------
+# get_parent
+# ---------------------------------------------------------------------------
+
+def test_get_parent_returns_entry(tmp_dir: Path) -> None:
+    record_lineage(tmp_dir, child_hash="child1", parent_hash="parent1")
+    entries = load_lineage(tmp_dir)
+    result = get_parent(entries, "child1")
+    assert result is not None
+    assert result.parent_hash == "parent1"
 
 
-def _make_args(tmp_dir, lineage_cmd, **kwargs):
-    ns = argparse.Namespace(lineage_cmd=lineage_cmd, snapshot_dir=tmp_dir, as_json=False, **kwargs)
-    return ns
+def test_get_parent_returns_none_for_unknown(tmp_dir: Path) -> None:
+    entries = load_lineage(tmp_dir)
+    assert get_parent(entries, "unknown") is None
 
 
-def test_cmd_lineage_list_returns_zero(tmp_dir):
-    record_lineage(tmp_dir, _entry("snap_v1.json"))
-    args = _make_args(tmp_dir, "list")
-    assert cmd_lineage(args) == 0
+def test_get_parent_latest_write_wins(tmp_dir: Path) -> None:
+    record_lineage(tmp_dir, child_hash="c", parent_hash="old_parent")
+    record_lineage(tmp_dir, child_hash="c", parent_hash="new_parent")
+    entries = load_lineage(tmp_dir)
+    result = get_parent(entries, "c")
+    assert result is not None
+    assert result.parent_hash == "new_parent"
 
 
-def test_cmd_lineage_list_json(tmp_dir, capsys):
-    record_lineage(tmp_dir, _entry("snap_v1.json", env="staging"))
-    args = _make_args(tmp_dir, "list", as_json=True)
-    cmd_lineage(args)
-    out = capsys.readouterr().out
-    data = json.loads(out)
-    assert data[0]["env"] == "staging"
+# ---------------------------------------------------------------------------
+# get_children
+# ---------------------------------------------------------------------------
+
+def test_get_children_returns_all_matching(tmp_dir: Path) -> None:
+    record_lineage(tmp_dir, child_hash="b1", parent_hash="root")
+    record_lineage(tmp_dir, child_hash="b2", parent_hash="root")
+    record_lineage(tmp_dir, child_hash="b3", parent_hash="other")
+    entries = load_lineage(tmp_dir)
+    children = get_children(entries, "root")
+    assert len(children) == 2
+    hashes = {e.child_hash for e in children}
+    assert hashes == {"b1", "b2"}
 
 
-def test_cmd_lineage_show_returns_one_when_missing(tmp_dir):
-    args = _make_args(tmp_dir, "show", snapshot_file="ghost.json")
-    assert cmd_lineage(args) == 1
+def test_get_children_empty_when_no_match(tmp_dir: Path) -> None:
+    record_lineage(tmp_dir, child_hash="only", parent_hash="p")
+    entries = load_lineage(tmp_dir)
+    assert get_children(entries, "nobody") == []
 
 
-def test_cmd_lineage_chain_json(tmp_dir, capsys):
-    record_lineage(tmp_dir, _entry("snap_v1.json"))
-    record_lineage(tmp_dir, _entry("snap_v2.json", parent_file="snap_v1.json"))
-    args = _make_args(tmp_dir, "chain", snapshot_file="snap_v2.json", as_json=True)
-    assert cmd_lineage(args) == 0
+# ---------------------------------------------------------------------------
+# cmd_lineage
+# ---------------------------------------------------------------------------
+
+def test_cmd_lineage_record_success(tmp_dir: Path) -> None:
+    from schemasnap.cmd_lineage import cmd_lineage_record
+    import argparse
+
+    snap_file = tmp_dir / "snap_prod_abc123.json"
+    snap_file.write_text(json.dumps({"environment": "prod", "hash": "abc123", "schema": {}}))
+
+    args = argparse.Namespace(
+        snapshot=str(snap_file),
+        parent=None,
+        snap_dir=str(tmp_dir),
+    )
+    rc = cmd_lineage_record(args)
+    assert rc == 0
+    entries = load_lineage(tmp_dir)
+    assert any(e.child_hash == "abc123" for e in entries)
+
+
+def test_cmd_lineage_record_missing_snapshot(tmp_dir: Path) -> None:
+    from schemasnap.cmd_lineage import cmd_lineage_record
+    import argparse
+
+    args = argparse.Namespace(
+        snapshot=str(tmp_dir / "nonexistent.json"),
+        parent=None,
+        snap_dir=str(tmp_dir),
+    )
+    rc = cmd_lineage_record(args)
+    assert rc == 1
+
+
+def test_cmd_lineage_list_empty(tmp_dir: Path, capsys: pytest.CaptureFixture) -> None:
+    from schemasnap.cmd_lineage import cmd_lineage_list
+    import argparse
+
+    args = argparse.Namespace(snap_dir=str(tmp_dir), fmt="text")
+    rc = cmd_lineage_list(args)
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "No lineage" in captured.out
+
+
+def test_cmd_lineage_list_json(tmp_dir: Path, capsys: pytest.CaptureFixture) -> None:
+    from schemasnap.cmd_lineage import cmd_lineage_list
+    import argparse
+
+    record_lineage(tmp_dir, child_hash="deadbeef", parent_hash=None)
+    args = argparse.Namespace(snap_dir=str(tmp_dir), fmt="json")
+    rc = cmd_lineage_list(args)
+    assert rc == 0
     data = json.loads(capsys.readouterr().out)
-    assert len(data) == 2
+    assert isinstance(data, list)
+    assert data[0]["child"] == "deadbeef"

@@ -1,65 +1,81 @@
-"""Snapshot lineage: track parent-child relationships between snapshots."""
+"""Snapshot lineage tracking — records parent→child relationships between snapshots."""
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Any
 
 
 @dataclass
 class LineageEntry:
-    snapshot_file: str
-    parent_file: Optional[str]
-    env: str
-    schema_hash: str
-    timestamp: str
+    child_hash: str
+    parent_hash: str | None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
-def _lineage_path(snapshot_dir: str) -> Path:
-    return Path(snapshot_dir) / ".lineage.jsonl"
+def _lineage_path(snap_dir: Path) -> Path:
+    return snap_dir / ".lineage.jsonl"
 
 
-def load_lineage(snapshot_dir: str) -> List[LineageEntry]:
-    """Load all lineage entries from the lineage journal."""
-    path = _lineage_path(snapshot_dir)
+def load_lineage(snap_dir: Path) -> list[LineageEntry]:
+    """Load all recorded lineage entries from *snap_dir*."""
+    path = _lineage_path(snap_dir)
     if not path.exists():
         return []
-    entries = []
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if line:
-            data = json.loads(line)
-            entries.append(LineageEntry(**data))
+    entries: list[LineageEntry] = []
+    for raw in path.read_text().splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        obj = json.loads(raw)
+        entries.append(
+            LineageEntry(
+                child_hash=obj["child_hash"],
+                parent_hash=obj.get("parent_hash"),
+                metadata=obj.get("metadata", {}),
+            )
+        )
     return entries
 
 
-def record_lineage(snapshot_dir: str, entry: LineageEntry) -> None:
-    """Append a lineage entry to the journal."""
-    path = _lineage_path(snapshot_dir)
+def record_lineage(
+    snap_dir: Path,
+    *,
+    child_hash: str,
+    parent_hash: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> LineageEntry:
+    """Append a lineage entry mapping *child_hash* to *parent_hash*."""
+    snap_dir.mkdir(parents=True, exist_ok=True)
+    entry = LineageEntry(
+        child_hash=child_hash,
+        parent_hash=parent_hash,
+        metadata=metadata or {},
+    )
+    path = _lineage_path(snap_dir)
     with path.open("a") as fh:
-        fh.write(json.dumps(asdict(entry)) + "\n")
+        fh.write(
+            json.dumps(
+                {
+                    "child_hash": entry.child_hash,
+                    "parent_hash": entry.parent_hash,
+                    "metadata": entry.metadata,
+                }
+            )
+            + "\n"
+        )
+    return entry
 
 
-def get_parent(snapshot_dir: str, snapshot_file: str) -> Optional[LineageEntry]:
-    """Return the lineage entry whose snapshot_file matches, or None."""
-    for entry in load_lineage(snapshot_dir):
-        if entry.snapshot_file == snapshot_file:
-            return entry
+def get_parent(entries: list[LineageEntry], child_hash: str) -> LineageEntry | None:
+    """Return the lineage entry whose *child_hash* matches, or *None*."""
+    for e in reversed(entries):  # latest write wins
+        if e.child_hash == child_hash:
+            return e
     return None
 
 
-def lineage_chain(snapshot_dir: str, snapshot_file: str) -> List[LineageEntry]:
-    """Return the ancestry chain starting from snapshot_file back to the root."""
-    index = {e.snapshot_file: e for e in load_lineage(snapshot_dir)}
-    chain: List[LineageEntry] = []
-    current = snapshot_file
-    visited = set()
-    while current and current not in visited:
-        entry = index.get(current)
-        if entry is None:
-            break
-        chain.append(entry)
-        visited.add(current)
-        current = entry.parent_file  # type: ignore[assignment]
-    return chain
+def get_children(entries: list[LineageEntry], parent_hash: str) -> list[LineageEntry]:
+    """Return all lineage entries whose *parent_hash* matches."""
+    return [e for e in entries if e.parent_hash == parent_hash]

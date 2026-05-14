@@ -1,76 +1,114 @@
-"""CLI sub-commands for snapshot lineage."""
+"""CLI subcommands for schema lineage tracking."""
 from __future__ import annotations
 
 import argparse
 import json
 import sys
-from dataclasses import asdict
+from pathlib import Path
 
-from schemasnap.lineage import load_lineage, get_parent, lineage_chain
+from .lineage import load_lineage, record_lineage, get_parent
+from .snapshot import load_snapshot
 
 
-def add_lineage_subparsers(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
-    p = sub.add_parser("lineage", help="Inspect snapshot lineage")
-    ls = p.add_subparsers(dest="lineage_cmd", required=True)
+def add_lineage_subparsers(sub: argparse.Action) -> None:  # type: ignore[type-arg]
+    p = sub.add_parser("lineage", help="Manage snapshot lineage")
+    s = p.add_subparsers(dest="lineage_cmd", required=True)
 
-    p_list = ls.add_parser("list", help="List all lineage entries")
-    p_list.add_argument("--snapshot-dir", default="snapshots")
-    p_list.add_argument("--json", dest="as_json", action="store_true")
+    rec = s.add_parser("record", help="Record parent→child lineage for a snapshot")
+    rec.add_argument("snapshot", help="Path to child snapshot file")
+    rec.add_argument("--parent", default=None, help="Path to parent snapshot file")
+    rec.add_argument("--dir", dest="snap_dir", default="snapshots",
+                     help="Snapshot directory (for lineage storage)")
+    rec.set_defaults(func=cmd_lineage_record)
 
-    p_show = ls.add_parser("show", help="Show parent of a snapshot")
-    p_show.add_argument("snapshot_file")
-    p_show.add_argument("--snapshot-dir", default="snapshots")
-    p_show.add_argument("--json", dest="as_json", action="store_true")
+    show = s.add_parser("show", help="Show lineage chain for a snapshot")
+    show.add_argument("snapshot", help="Path to snapshot file")
+    show.add_argument("--dir", dest="snap_dir", default="snapshots")
+    show.add_argument("--fmt", choices=["text", "json"], default="text")
+    show.set_defaults(func=cmd_lineage_show)
 
-    p_chain = ls.add_parser("chain", help="Show full ancestry chain of a snapshot")
-    p_chain.add_argument("snapshot_file")
-    p_chain.add_argument("--snapshot-dir", default="snapshots")
-    p_chain.add_argument("--json", dest="as_json", action="store_true")
+    lst = s.add_parser("list", help="List all recorded lineage entries")
+    lst.add_argument("--dir", dest="snap_dir", default="snapshots")
+    lst.add_argument("--fmt", choices=["text", "json"], default="text")
+    lst.set_defaults(func=cmd_lineage_list)
 
     p.set_defaults(func=cmd_lineage)
 
 
 def cmd_lineage(args: argparse.Namespace) -> int:
-    if args.lineage_cmd == "list":
-        entries = load_lineage(args.snapshot_dir)
-        data = [asdict(e) for e in entries]
-        if args.as_json:
-            print(json.dumps(data, indent=2))
-        else:
-            if not data:
-                print("No lineage entries found.")
-            for e in data:
-                parent = e["parent_file"] or "<root>"
-                print(f"{e['snapshot_file']}  <-  {parent}  [{e['env']}]")
-        return 0
-
-    if args.lineage_cmd == "show":
-        entry = get_parent(args.snapshot_dir, args.snapshot_file)
-        if entry is None:
-            print(f"No lineage entry for {args.snapshot_file}", file=sys.stderr)
-            return 1
-        if args.as_json:
-            print(json.dumps(asdict(entry), indent=2))
-        else:
-            parent = entry.parent_file or "<root>"
-            print(f"snapshot : {entry.snapshot_file}")
-            print(f"parent   : {parent}")
-            print(f"env      : {entry.env}")
-            print(f"hash     : {entry.schema_hash}")
-        return 0
-
-    if args.lineage_cmd == "chain":
-        chain = lineage_chain(args.snapshot_dir, args.snapshot_file)
-        if not chain:
-            print(f"No lineage data for {args.snapshot_file}", file=sys.stderr)
-            return 1
-        data = [asdict(e) for e in chain]
-        if args.as_json:
-            print(json.dumps(data, indent=2))
-        else:
-            for i, e in enumerate(data):
-                prefix = "  " * i + ("└─ " if i else "")
-                print(f"{prefix}{e['snapshot_file']}  [{e['env']}]")
-        return 0
-
+    """Dispatch to lineage sub-command."""
+    if hasattr(args, "func") and args.func is not cmd_lineage:
+        return args.func(args)
+    print("Use a lineage sub-command: record | show | list", file=sys.stderr)
     return 1
+
+
+def cmd_lineage_record(args: argparse.Namespace) -> int:
+    snap_path = Path(args.snapshot)
+    if not snap_path.exists():
+        print(f"Snapshot not found: {snap_path}", file=sys.stderr)
+        return 1
+    snap = load_snapshot(str(snap_path))
+    parent_hash: str | None = None
+    if args.parent:
+        parent_path = Path(args.parent)
+        if not parent_path.exists():
+            print(f"Parent snapshot not found: {parent_path}", file=sys.stderr)
+            return 1
+        parent_snap = load_snapshot(str(parent_path))
+        parent_hash = parent_snap.get("hash")
+    child_hash = snap.get("hash")
+    if not child_hash:
+        print("Snapshot missing 'hash' field.", file=sys.stderr)
+        return 1
+    snap_dir = Path(args.snap_dir)
+    record_lineage(snap_dir, child_hash=child_hash, parent_hash=parent_hash,
+                   metadata={"child_file": str(snap_path), "parent_file": args.parent})
+    print(f"Recorded lineage: {parent_hash or 'root'} -> {child_hash}")
+    return 0
+
+
+def cmd_lineage_show(args: argparse.Namespace) -> int:
+    snap_path = Path(args.snapshot)
+    if not snap_path.exists():
+        print(f"Snapshot not found: {snap_path}", file=sys.stderr)
+        return 1
+    snap = load_snapshot(str(snap_path))
+    child_hash = snap.get("hash")
+    snap_dir = Path(args.snap_dir)
+    entries = load_lineage(snap_dir)
+    chain = []
+    current = child_hash
+    visited: set[str] = set()
+    while current:
+        if current in visited:
+            break
+        visited.add(current)
+        entry = get_parent(entries, current)
+        chain.append({"hash": current, "parent": entry.parent_hash if entry else None})
+        current = entry.parent_hash if entry else None
+    if args.fmt == "json":
+        print(json.dumps(chain, indent=2))
+    else:
+        for item in chain:
+            parent_label = item["parent"] or "(root)"
+            print(f"  {item['hash'][:12]}  <-  {parent_label[:12] if item['parent'] else '(root)'}")
+    return 0
+
+
+def cmd_lineage_list(args: argparse.Namespace) -> int:
+    snap_dir = Path(args.snap_dir)
+    entries = load_lineage(snap_dir)
+    if args.fmt == "json":
+        data = [
+            {"child": e.child_hash, "parent": e.parent_hash, "metadata": e.metadata}
+            for e in entries
+        ]
+        print(json.dumps(data, indent=2))
+    else:
+        if not entries:
+            print("No lineage entries recorded.")
+        for e in entries:
+            parent_label = e.parent_hash[:12] if e.parent_hash else "(root)"
+            print(f"  {e.child_hash[:12]}  parent={parent_label}")
+    return 0

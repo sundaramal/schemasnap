@@ -1,70 +1,83 @@
-"""Compare snapshots across environments and produce structured results."""
+"""compare.py — high-level environment comparison.
 
-from dataclasses import dataclass
+Compares two schema snapshots (by environment name or explicit file path)
+and returns a CompareResult that bundles the SchemaDiff together with a
+pre-rendered report string.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
 from typing import Optional
 
+from schemasnap.diff import diff_snapshots, has_changes, SchemaDiff
+from schemasnap.report import render_text_report, render_json_report
 from schemasnap.snapshot import load_snapshot, latest_snapshot
-from schemasnap.diff import diff_snapshots, SchemaDiff, has_changes
-from schemasnap.report import render_text_report, render_json_report, write_report
 
 
 @dataclass
 class CompareResult:
-    source_env: str
-    target_env: str
-    source_snapshot_path: str
-    target_snapshot_path: str
+    env_a: str
+    env_b: str
     diff: SchemaDiff
-    has_changes: bool
+    report: str
+    has_changes: bool = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.has_changes = has_changes(self.diff)
 
 
 def compare_environments(
-    source_env: str,
-    target_env: str,
-    snapshot_dir: str = "snapshots",
-    source_snapshot: Optional[str] = None,
-    target_snapshot: Optional[str] = None,
+    snapshot_dir: str,
+    env_a: str,
+    env_b: str,
+    snapshot_file_a: Optional[str] = None,
+    snapshot_file_b: Optional[str] = None,
 ) -> CompareResult:
-    """Compare schemas between two environments using their latest (or specified) snapshots."""
-    source_path = source_snapshot or latest_snapshot(snapshot_dir, source_env)
-    target_path = target_snapshot or latest_snapshot(snapshot_dir, target_env)
+    """Load two snapshots and return a CompareResult.
 
-    if source_path is None:
-        raise FileNotFoundError(f"No snapshot found for environment: {source_env}")
-    if target_path is None:
-        raise FileNotFoundError(f"No snapshot found for environment: {target_env}")
+    If *snapshot_file_a* / *snapshot_file_b* are provided they are used
+    directly; otherwise the latest snapshot for each environment is used.
+    """
+    file_a = snapshot_file_a or latest_snapshot(snapshot_dir, env_a)
+    file_b = snapshot_file_b or latest_snapshot(snapshot_dir, env_b)
 
-    source_schema = load_snapshot(source_path)
-    target_schema = load_snapshot(target_path)
+    schema_a = load_snapshot(file_a)["schema"]
+    schema_b = load_snapshot(file_b)["schema"]
 
-    diff = diff_snapshots(source_schema, target_schema)
-
+    diff = diff_snapshots(schema_a, schema_b)
     return CompareResult(
-        source_env=source_env,
-        target_env=target_env,
-        source_snapshot_path=source_path,
-        target_snapshot_path=target_path,
+        env_a=env_a,
+        env_b=env_b,
         diff=diff,
-        has_changes=has_changes(diff),
+        report=render_text_report(env_a, env_b, diff),
     )
 
 
 def compare_and_report(
-    source_env: str,
-    target_env: str,
-    snapshot_dir: str = "snapshots",
-    output_format: str = "text",
-    output_path: Optional[str] = None,
+    snapshot_dir: str,
+    env_a: str,
+    env_b: str,
+    fmt: str = "text",
+    snapshot_file_a: Optional[str] = None,
+    snapshot_file_b: Optional[str] = None,
 ) -> CompareResult:
-    """Compare environments and optionally write a report to disk."""
-    result = compare_environments(source_env, target_env, snapshot_dir)
+    """Like compare_environments but renders the report in the requested format."""
+    file_a = snapshot_file_a or latest_snapshot(snapshot_dir, env_a)
+    file_b = snapshot_file_b or latest_snapshot(snapshot_dir, env_b)
 
-    if output_format == "json":
-        report_content = render_json_report(result.diff, source_env, target_env)
+    schema_a = load_snapshot(file_a)["schema"]
+    schema_b = load_snapshot(file_b)["schema"]
+
+    diff = diff_snapshots(schema_a, schema_b)
+
+    if fmt == "json":
+        report = render_json_report(env_a, env_b, diff)
     else:
-        report_content = render_text_report(result.diff, source_env, target_env)
+        report = render_text_report(env_a, env_b, diff)
 
-    if output_path:
-        write_report(report_content, output_path)
-
-    return result
+    return CompareResult(
+        env_a=env_a,
+        env_b=env_b,
+        diff=diff,
+        report=report,
+    )
